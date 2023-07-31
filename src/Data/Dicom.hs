@@ -9,14 +9,14 @@ import Control.Monad.Reader (ReaderT, runReaderT, ask)
 import Control.Monad.Trans.Class (lift)
 import Data.Binary qualified as Bin
 import Data.Binary.Get qualified as Bin
-import Data.Word (Word8, Word16, Word32)
+import Data.ByteString.Lazy qualified as B
+import Data.ByteString.Lazy.Char8 qualified as C
 import Data.Int (Int64)
 import Data.List (find)
+import Data.Word (Word8, Word16, Word32)
 import Numeric (showHex)
 import Prelude hiding (LT)
 import Text.Read (readMaybe)
-import qualified Data.ByteString.Lazy as B
-import qualified Data.ByteString.Lazy.Char8 as C
 
 type DataSet = [DicomElement]
 
@@ -53,10 +53,12 @@ data VR
   | UT
   deriving (Eq, Read, Show)
 
+type VL = Int64
+
 data DicomElement = DicomElement
   { elementTag :: Tag
   , elementVR :: VR
-  , elementVL :: Int64
+  , elementVL :: VL
   , elementValue :: B.ByteString
   }
   deriving (Eq, Show)
@@ -98,17 +100,25 @@ parseDicomElement :: (MonadEndianness m, MonadFail m) =>  m DicomElement
 parseDicomElement = do
   group <- getWord16
   element <- getWord16
-  vr1 <- getWord8
-  vr2 <- getWord8
-  let vr = C.unpack $ B.pack [vr1,vr2]
-  case readVR vr of
-    Just vr' -> do
-      vl <- if vr' `elem` unreserved
-        then fromIntegral <$> getWord16
-        else fromIntegral <$> (skip 2 >> getWord32)
-      value <- getLazyByteString (vl)
-      pure (DicomElement (Tag group element) vr' vl value)
-    Nothing -> fail $  "Invalid VR: " ++ show vr
+  if group ==  0xfffe
+    then do
+      vl <- fromIntegral <$> (getWord32)
+      value <- getLazyByteString vl
+      pure (DicomElement (Tag group element) OB vl value)
+    else do
+      vr1 <- getWord8
+      vr2 <- getWord8
+      let vr = C.unpack $ B.pack [vr1,vr2]
+      case readVR vr of
+        Just vr' -> do
+          vl <- if vr' `elem` unreserved
+            then fromIntegral <$> getWord16
+            else fromIntegral <$> (skip 2 >> getWord32)
+          value <- case vl of
+            0xffffffff -> getLazyByteString 0
+            _ -> getLazyByteString (vl)
+          pure (DicomElement (Tag group element) vr' vl value)
+        Nothing -> fail $  "Invalid VR: " ++ show vr
 
 parseDicomMeta :: (MonadEndianness m, MonadFail m) =>  m [DicomElement]
 parseDicomMeta = parseUntil isNotGroup2 parseDicomElement
@@ -152,14 +162,14 @@ parseDicom = do
         Just (DicomElement _ _ _ value) ->
           if | (B.filter (/= 0x00) value) == (C.pack "1.2.840.10008.1.2.1") -> pure LittleEndian
              | (B.filter (/= 0x00) value) == (C.pack "1.2.840.10008.1.2.2") -> pure BigEndian
-             | otherwise -> fail $ "Unknown transfer syntax: " ++ show value
+             | otherwise -> pure LittleEndian
         Nothing -> fail "No transfer syntax specified"
 
-parseDicomFile :: B.ByteString -> [DicomElement]
+parseDicomFile :: B.ByteString -> Either String [DicomElement]
 parseDicomFile bs =
   case Bin.runGetOrFail parseDicom bs of
-    Left (_, _, err) -> error err
-    Right (_, _, result) -> result
+    Left (_, _, err) -> Left err
+    Right (_, _, result) -> Right result
 
 printDicom :: [DicomElement] -> IO ()
 printDicom d = sequence_ $ printElem <$> d
@@ -169,9 +179,3 @@ printDicom d = sequence_ $ printElem <$> d
 
     showWord16Hex :: Word16 -> String
     showWord16Hex n = "0x" ++ showHex n ""
-
-main :: IO ()
-main = do
-  dicomFile <- readDicomFile "test/data/test.dcm"
-  let dicomElements = parseDicomFile dicomFile
-  printDicom dicomElements
